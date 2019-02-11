@@ -1,0 +1,241 @@
+---
+title: 'CPLN 550 Final Project: Predicting Bikeshare Usage Using Weather Conditions
+  in Seattle'
+author: "George Poon"
+date: "December 13, 2018"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      cache=TRUE,
+                      tidy = TRUE, 
+                      message=FALSE, fig.width = 7, fig.height = 4,
+                      fig.align='left')
+if(!require("pacman")) install.packages("pacman")
+
+pacman::p_load(dplyr, ggplot2, ggmap, ggcorrplot, corrplot, glmnet, factoextra, FactoMineR, leaps, hms)
+
+station <- read.csv("station.csv")
+trip <- read.csv("trip.csv")
+weather <- read.csv("weather.csv")
+```
+
+##Introduction
+Seattle was ranked America's riendliest city to cyclist in 2018 by Bicycling.com due to its robust infrastructure and myriad of bikeshare program. However, the city is also prone to frequent unfavorable weather pattern, which has likely detered the initial adoption of cycling culture. The city's own bikeshare program, Pronto! was established in 2014 but due to low ridership and funding, was shut down in early 2017. While the absence of a public sector monopoly had allowed for a booming priavte sector bikeshare takeover, it is worthwhile to investigate to what degree was Pronto!'s demise due to weather as well as what particular weather feature. Therefore, I gathered three related datsets from Kaggle. The dataset "station.csv" contains information about the 58 Pronto! stations located throughout Seattle. The dataset "trip.csv" describes the 286858 trips taken from 2014 to 2016 on Pronto! bikes, as well as the riders demographics if they are registered members. Finally, dataset "weather.csv" covers the citywide daily weather pattern in the same time period. We will be combining the three datasets and mainly use the weather related variables to predict 1) average number of riders per day as well as 2) average duration of each trip.
+
+##Methodology
+
+##Exploratory Analysis and Data Cleaning
+We first explore the summaries of the three datasets. For station, the most important information to extract here are the longitudes and latitudes, which would enable us to examine them visually on a map. It is also worth noting that a few stations were decommissioned at some point in the timeline. This decrease may effect the duration and frequency of bikeshare usages for residents who live around the decommisioned stations. In additional, by combining this dataset with the trip dataset, we can show the top 10 stations that the like to start and finish at.
+```{r}
+top.starts <- trip %>% group_by(from_station_name) %>% 
+                summarize(count = n()) %>% 
+                arrange(desc(count)) %>% 
+                top_n(10)
+
+top.stops <- trip %>% group_by(to_station_name) %>% 
+                summarize(count = n()) %>%
+                arrange(desc(count)) %>% 
+                top_n(10)
+
+popular.stations <- data.frame(start.station = top.starts$from_station_name,
+                               total.starts = top.starts$count,
+                               stop.station = top.stops$to_station_name,
+                               total.stops = top.stops$count)
+
+ggplot(popular.stations,aes(x=reorder(start.station, -total.starts),y=total.starts)) +
+  geom_bar(stat="identity", width=0.5) + scale_color_grey() + 
+  theme_classic() + coord_flip() +
+  labs(x = "Station Name", y = "Total Number of Starting Trips",
+       title = "Top 10 Starting Stations")
+```
+```{r}
+ggplot(popular.stations,aes(x=reorder(stop.station, -total.starts),y=total.stops)) +
+  geom_bar(stat="identity", width=0.5) + scale_color_grey() + 
+  theme_classic() + coord_flip() +
+  labs(x = "Station Name", y = "Total Number of Trip Ends",
+       title = "Top 10 Ending Stations")
+```
+
+A map of Seattle overlayed with all 58 Pronto! stations is shown below. The teal dots represent stations that were functional throughout the time covered by the dataset, while the pink dots represent stations that were decommissioned sometime along the way. The stations are mostly located in Downtown Seattle with a few dispersed to the north, along the University district. These locations were likely chosen because of their high surrounding population density. 
+```{r}
+key='AIzaSyCfKkZsNjTLoQs9JFzVvOEMPFiR0eebcS4'
+ggmap::register_google(key=key)
+seattle_map <- get_map(location = c(-122.325,47.632), zoom = 13)
+ggmap(seattle_map) + 
+  geom_point(data=station, aes(x=long, y=lat, color=station$decommission_date==""), size=3, alpha=1) +
+  scale_color_discrete(name = "Station Status as of September, 2016", labels = c("Functioning", "Decommissioned"))
+```
+For the trips, we first took out a few empty columns that were created in the process of data transfer. By glancing at the data summary, we noted that the trips recorded the trip dataset includes data from both members and short-term pass holder. In additional, there are a few trips that took an extreme long durations, which couldd either be record errors or just outliers. The histogram below shows the first 95 percentile of trip duration for both types of users. Unsurprisingly, the distribution of trip duration is right-skewed overall as the majority of trips taken are relatively short. As a result, we will transform tripduration when preparing for the regression model. In additional, the majority of trips data collected are from members. They take much more short trips than the short term pass holders, who likely are using the bikes for long periods of sightseeing in the city. 
+
+```{r}
+ggplot(data = subset(trip, trip$tripduration < quantile(trip$tripduration,0.95)),
+       aes(x = tripduration/60, fill = usertype )) +
+       geom_histogram(binwidth = 0.5, color = "black") + 
+       labs(x = "Trip Duration(in minutes)", y = "Trip Count") + 
+       scale_x_continuous(breaks = seq(0,54,3))
+```
+
+We then explored the relationship between age, gender and bikeshare usage. Demographics information such as age and gender are only recorded for the members, so we created a new dataset excluding trips made by short term pass holder. Age was extracted by subtracting birth year of the user from the date. The following histogram of age and gender of the bikeshare users shows that the majority are male young adults. The lack of young, old and female riders could be attributed to safety concerns, which may only be exacerbated by adverse weather conditions. 
+```{r}
+trip[,13:20] <- NULL
+
+trip_clean <- trip %>% filter(usertype=="Member") %>% mutate(date=as.Date(starttime, "%m/%d/%Y"),age=as.integer(format(date,format="%Y"))-as.integer(as.character(birthyear))) %>% filter(!is.na(age))
+
+ggplot(data = trip_clean, aes(x = age, fill = gender)) + 
+    geom_histogram(binwidth = 1, color = "black") + 
+    scale_x_continuous(breaks = seq(0,80,4)) + 
+    labs(x = "Age of bike rider", y = "Trip Count")
+```
+
+Weather conditions will be the main predictors in our regression model. 
+We first filled in the NAs by using appropriate approximations in related variables (refer to the code). In additional, we also packed the weather events variable categorical levels from 10 to 5, keeping only broad descriptions like rain, fog, snow and thunderstorm.  
+```{r}
+weather$Mean_Temperature_F[490] <- mean(weather$Max_Temperature_F[490],weather$Min_TemperatureF[490])
+
+levels(weather$Max_Gust_Speed_MPH)[levels(weather$Max_Gust_Speed_MPH)=="-"] <- "0"
+weather$Max_Gust_Speed_MPH <- as.numeric(weather$Max_Gust_Speed_MPH)
+weather$Max_Gust_Speed_MPH[is.na(weather$Max_Gust_Speed_MPH)] <- 0
+
+weather$Events_clean <- weather$Events
+weather$Events_clean[weather$Events_clean=="Rain , Snow"|
+                       weather$Events_clean=="Rain-Snow"] <- "Snow"
+weather$Events_clean[weather$Events_clean=="Fog , Rain"|
+                       weather$Events_clean=="Fog-Rain"] <- "Fog"
+weather$Events_clean[weather$Events_clean=="Rain , Thunderstorm"|
+                       weather$Events_clean=="Rain-Thunderstorm"] <- "Rain-Thunderstorm"
+levels(weather$Events_clean)[levels(weather$Events_clean)=="Rain-Thunderstorm"] <- "Thunderstorm"
+weather$Events_clean <- droplevels(weather)$Events_clean
+weather$Events <- NULL
+```
+
+However, many of the variables are correlated as the dataset reports minimum, mean and maximum of different weather characteristics. For simplification sake, we first examine the mean of each variable, shown in the corrplot below. There are significant correlation (defined as >|0.5|) between temperature & dew point, temperature & humidity and wind speed & wind gust. However, there might be other correlations of weather conditions that are found in minimum and maximum that we will need to take into considerations later. 
+
+```{r}
+weather_mean <- subset(weather[c("Mean_Temperature_F","MeanDew_Point_F","Mean_Humidity","Mean_Sea_Level_Pressure_In","Mean_Visibility_Miles","Mean_Wind_Speed_MPH","Max_Gust_Speed_MPH","Precipitation_In")])
+cormat <- round(cor(weather_mean),2)
+corr <- ggcorrplot(cormat,hc.order=TRUE,type="lower",lab=T,
+           outline.col="white",lab_size = 3,
+           ggtheme=ggplot2::theme_classic,title = "Correlation plot between mean of weather variables",
+           colors=c("#6D9EC1","white","#E46726"))
+corr + theme(plot.title = element_text(hjust = 0.7)) 
+```
+
+Since the weather data is gathered on a daily basis while the trip data contains many observations in a given day, we decided to aggregate the latter on the day level into number of trips taken (or ridership) and the mean of trip durations(log transformed). Then we merged the weather data and this new trip-day data to create the dataset ready for analysis. Below is the histogram of the newly created variable obtained from log transformed mean trip duration. 
+```{r}
+trip_day <- trip %>% mutate(date=as.Date(starttime, "%m/%d/%Y")) %>% group_by(date) %>% summarise(num_trips=n(),mean_duration=mean(log(tripduration)))
+
+weather[,1] <- as.Date(weather[,1],"%m/%d/%Y")
+colnames(weather)[1] <- "date"
+weather_trip <- merge(weather,trip_day,by.x="date")
+
+ggplot(data = weather_trip, aes(x = mean_duration)) + 
+    geom_histogram(binwidth = 0.01, color = "black") + 
+    labs(x = "Daily Mean Trip Duration(Log Transformed)", y = "Count")
+```
+
+##Model Selection
+We first created two full linear models using all weather variables against each of the target variable, ridership and mean trip duration. The ridership model outputs an initial adjusted R Squared of 0.361 while the duration model outputs an initial value of 0.236, neither of which are very high and many of the p values are insigificant at the 0.05 alpha level, which means that there is a need to optimize these two models by subset predictors selection.   
+```{r,eval=F}
+lm.rides <- lm(num_trips~.-date-mean_duration,data=weather_trip)
+summary(lm.rides)
+lm.dur <- lm(mean_duration~.-date-num_trips,data=weather_trip)
+summary(lm.dur)
+```
+
+To accomplish this, we performed the exhaustive subsets search which is runs both forward and backward stepwise selections. By using the optimal set of variables according to the minimum Cp approach, we reduced the ridership model from 30 variables to 12, and the ridership model down to 3 variables, both with no penalities in adjusted R Squared. However not all variables are statistically significant at the 0.05 level as the regsubsets algorithm uses a different criterion than the linear model approach. 
+```{r}
+subset.rides <- regsubsets(num_trips~.-date-mean_duration,data=weather_trip,nvmax=25,method="exhaustive")
+subset.rides.fit = summary(subset.rides)
+subset.rides.fit <- data.frame(cp=subset.rides.fit$cp)
+which(subset.rides.fit$cp==min(subset.rides.fit$cp))
+
+coef.min <- coef(subset.rides,13)
+var.min <- rownames(as.matrix(coef.min))
+lm.input <- as.formula(paste("num_trips", "~", paste(var.min[-c(1,13,14)], collapse = "+"), "+ Events_clean"))
+lm.input
+
+lm.rides2 <- lm(lm.input,data=weather_trip)
+summary(lm.rides2)
+```
+```{r}
+subset.dur <- regsubsets(mean_duration~.-date-num_trips,data=weather_trip,nvmax=25,method="exhaustive")
+subset.dur.fit = summary(subset.dur)
+subset.dur.fit <- data.frame(cp=subset.dur.fit$cp)
+which(subset.dur.fit$cp==min(subset.dur.fit$cp))
+
+coef.min <- coef(subset.dur,5)
+var.min <- rownames(as.matrix(coef.min))
+lm.input <- as.formula(paste("mean_duration", "~", paste(var.min[-c(1,4:6)], collapse = "+"), "+ Events_clean"))
+
+lm.dur2 <- lm(lm.input,data=weather_trip)
+summary(lm.dur2)
+```
+Since many of the variables are correlated, there are dangers of multicolinearity in the previous linear regression models. we will employ principal component analysis (PCA) in which variables are linearly recombined in the direction of the greatest covariancee. It is likely that we can use only the first few reduced principal components to explain the majority of variances in the data. This would cause our model to be more interpretable. To see whether we could reduce the data to only a few directions, we also plotted the variances of each weather condition against the two greatest principal components. (Fig ) The results below show that in general, groups of more than one weather condition are covaried together, wich means that PCA could be beneficial.   
+```{r}
+weather.pca <- PCA(weather_trip[,2:20],scale.unit = TRUE,graph=FALSE)
+fviz_pca_var(weather.pca, col.var = "black",repel=TRUE,labelsize = 3)
+```
+By plotting the percentage of variance explained of the first 10 principal components, we can see there is a gradual decrease in the percentage with each succeeding principal component. We will use 5% variance explained as a stopping rule to decide which principal component will be the last one getting selected. In this case, the 5th principal component explained 5.9% of variance while the 6th explained only 4.4%. Therefore, we will likely only keep 5 principal components in the linear models. 
+
+```{r}
+eig.val <- get_eigenvalue(weather.pca)
+eig.val
+
+fviz_eig(weather.pca, addlabels = TRUE, ylim = c(0, 50),main="Principal Component vs. Amount of Variance Explained")
+```
+To understand which variables contributed to each principal component, we also plotted the coefficient magnitudes in the linearly combination that transformed the original variables, shown below. We can observe that the first principal component is primarily composed of temperature, dew point as well as some degrees of humidity and visibility miles. On the other hand, the second component primarily consists of sea level pressure, humidity, wind speed and precipitation, which makes sense as each principal component is supposed to maximally independent of each other. 
+```{r}
+var <- get_pca_var(weather.pca)
+corrplot(var$cos2, is.corr=FALSE, tl.cex=0.8, tl.col="black", tl.srt=45, cl.ratio=0.2, cl.align = "l")
+```
+The coefficients of the linear combinations that transformed the original variables into the first five principal components are shown below:
+```{r}
+weather.pca.df <- prcomp(weather_trip[,2:20],scale.=TRUE)
+weather.pca <- weather.pca.df$x
+round(weather.pca.df$rotation[,1:5], 5) 
+```
+
+By incorporating the first five principal components the weather conditions as well as the categorical weather event in the ridership model, we observed that in fact, only the first two components are significant at the 0.05 level so we removed the third to the fifth components. This reduced model has a relatively high adjusted R Squared of 0.31, only 0.05 less than the best subset model. We then created a second model that incorporates the interaction effect between the first principal component and the weather event as well as a third model that adds the interaction effect between the second principal component and the weather event. ANOVA (analysis of variance) result indicates that while the first component's interaction effect significantly improves the model with at the 0.05 level with a F score of 3.32, the second component's interaction effect does not improve the model at the same significance level so we will not include it in the final model. This interaction-PCA model improves the adjusted R squared to 0.32.   
+```{r}
+pca.trips <- lm(num_trips~weather.pca[,1:2]+Events_clean,data=weather_trip)
+pca.trips2 <- lm(num_trips~weather.pca[,1]*Events_clean+weather.pca[,2],data=weather_trip)
+pca.trips3 <- lm(num_trips~weather.pca[,1]*Events_clean+weather.pca[,2]*Events_clean,data=weather_trip)
+anova(pca.trips,pca.trips2)
+anova(pca.trips2,pca.trips3)
+summary(pca.trips2)
+```
+
+Using the same procedure, we found that in the duration model only the first two principal components and the first's interaction effect with weather event were found to be significant at the 0.05 level. This new duration model has an adjusted R squared of 0.239, again only a slight decrease from the previous best subsets model's R squared of 0.244.
+```{r}
+pca.dur <- lm(mean_duration~weather.pca[,1:2]+Events_clean,data=weather_trip)
+pca.dur2 <- lm(mean_duration~weather.pca[,1]*Events_clean+weather.pca[,2],data=weather_trip)
+pca.dur3 <- lm(mean_duration~weather.pca[,1:2]*Events_clean,data=weather_trip)
+anova(pca.dur,pca.dur2)
+anova(pca.dur2,pca.dur3)
+summary(pca.dur2)
+```
+
+##Model Analysis
+Since both models only used the first two principal components, it is helpful to summarize the breakdown of the two according to the previous coefficients.
+
+The first component's main composition:
++ Increase in Humidity
+- Decrease in Temperature, Dew Point and Visibility Miles
+
+The second component's main composition: 
++ Increase in Wind/Gust Speed, Precipitation, Dew Point and Humidity
+- Decrease in Sea Level Pressure
+
+So we could summarize the first component as measuring how cold and moist the weather is and the second component as how rainy and windy the weather is. 
+
+In our final ridership model, we have an intercept of 398 Pronto! riders per day. Controlling for all other variables, a one unit increase in the first principal component on average decreases ridership by 32. Each unit increase in the second principal component also decreases the ridership on average by 35. So while the first component is more important to the model as it explains more variance, but the second component has a greater effect, meaning that residents in Seattle are more adverse to the amount of rain and wind than how cold or moist it is outside when deciding to bike or not. Among the weather event categories, only the rain level is significant at the 0.05 level and unexpectedly, it increases the average ridership by 58 compared to when there is no weather event. This could be partially explained by the fact that the average rain day in Seattle is more akin to a light drizzle that could improve the outdoors air quality without causing too much inconveniences. The interaction effect also fills in this gap as the ridership goes down a further 24 with each additional unit of the first principal component when it is raining. This means that the a decrease in temperature and visbility are more of a concern when it is raining outisde. 
+
+On the other hand, in the final duration model, a unit increase in the first component on average decreases the mean duration by roughly 3.47 percent while a unit increase in the second component decreases the mean duration by roughly 1.74 percent, which means that cold and moisture are more likely to make the riders take a shorter trip than how hard the wind is blowing or how much it is raining. Different from the riderhsip model, both fog and rain are significant at the 0.05 p value level as fog decreases mean duration by a 25 percent while rain decreases it by 7.9 percent. In the event of fog, each additional unit of the first principal component increases the mean duration by 4.59 percent, balancing out the massive decrease from the base event of fog. Meanwhile, when it rains, one unit increase in the first component further decreases duration by 1.7 percent, as a compensation for the low base adverse effect brought by rain.
+
+While the categorical levels of thunderstorm and snow are not statistically significant in both models, this is mainly due to the sparse number of days where these two conditions occur. Their high negative coefficients in both models tell us that they likely adversely impact both ridership and trip duration. 
+
+##Conclusion
